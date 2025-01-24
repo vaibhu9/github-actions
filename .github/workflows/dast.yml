@@ -1,0 +1,211 @@
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  checks: write
+  packages: write
+
+jobs:
+  dast-scan:
+    name: DAST Scan
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'microsoft'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@417ae3ccd767c252f5661f1ace9f835f9654f2b5 
+        with:
+          gradle-version: 8.5
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build with Gradle Wrapper
+        run: ./gradlew build -x test
+
+      # Login to docker container registry
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
+
+      # Run Application using container image
+      - name: Run application in container to scan with ZAP
+        run: docker run -d -p 9090:9090 --name github-actions ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest
+    
+      - name: Wait 10 seconds to start application
+        run: sleep 10
+
+      - name: Application container logs
+        run: docker logs github-actions
+
+      - name: Test container is running
+        run: curl -v localhost:9090/com.amazingcode.in/api/message
+     
+      - name: Run ZAP OWASP full scan
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+          token: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
+          target: 'http://localhost:9090'
+          cmd_options: '-a -j -l WARN -r report_html.html -w report_md.md -J report_json.json -z "-addoninstallall" '
+          allow_issue_writing: true
+
+      - name: Convert ZAP JSON to SARIF
+        run: |
+          jq -r '
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+              {
+                "tool": {
+                  "driver": {
+                    "name": "OWASP ZAP",
+                    "informationUri": "https://www.zaproxy.org/",
+                    "version": ."@version",
+                    "rules": [
+                      .site[].alerts[] | {
+                        "id": "ZAP-\(.pluginid)",
+                        "shortDescription": {
+                          "text": .name
+                        },
+                        "fullDescription": {
+                          "text": .desc | gsub("</?p>"; " ")
+                        },
+                        "help": {
+                          "text": (
+                            "Solution: " + (.solution | gsub("</?p>"; " ")) +
+                            " Reference: " + (.reference | gsub("</?p>"; " ")) +
+                            if .otherinfo != "" then " Other info: " + (.otherinfo | gsub("</?p>"; " ")) else "" end
+                          )
+                        },
+                        "defaultConfiguration": {
+                          "level": (
+                            if .riskcode == "3" then "error"
+                            elif .riskcode == "2" then "warning"
+                            elif .riskcode == "1" then "note"
+                            else "none"
+                            end
+                          )
+                        },
+                        "properties": {
+                          "tags": [
+                            "security",
+                            "CWE-\(.cweid)",
+                            "WASC-\(.wascid)"
+                          ],
+                          "precision": (
+                            if .confidence == "3" then "high"
+                            elif .confidence == "2" then "medium"
+                            else "low"
+                            end
+                          ),
+                          "security-severity": .riskcode
+                        }
+                      }
+                    ]
+                  }
+                },
+                "results": [
+                  .site[].alerts[] | .instances[] as $instance | {
+                    "ruleId": "ZAP-\(.pluginid)",
+                    "level": (
+                      if .riskcode == "3" then "error"
+                      elif .riskcode == "2" then "warning"
+                      elif .riskcode == "1" then "note"
+                      else "none"
+                      end
+                    ),
+                    "message": {
+                      "text": .desc | gsub("</?p>"; " ")
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": $instance.uri
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "issue_confidence": .confidence,
+                      "issue_severity": .riskcode,
+                      "risk_desc": .riskdesc,
+                      "method": $instance.method,
+                      "param": $instance.param,
+                      "attack": $instance.attack,
+                      "evidence": $instance.evidence,
+                      "otherinfo": ($instance.otherinfo // ""),
+                      "cwe_id": .cweid,
+                      "wasc_id": .wascid
+                    }
+                  }
+                ],
+                "invocations": [
+                  {
+                    "executionSuccessful": true,
+                    "timestamp": ."@generated"
+                  }
+                ]
+              }
+            ]
+          }' report_json.json > zap_report.sarif
+
+      - name: Upload SARIF report
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAST_Report.sarif
+          path: ./zap_report.sarif
+
+      - name: Upload JSON report
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAST_Report.json
+          path: ./report_json.json
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAST_Report.html
+          path: ./report_html.html
+
+      - name: Package JSON Report & Upload to Container registry
+        run: |
+          echo "FROM alpine" > Dockerfile
+          echo "COPY report_json.json /report_json.json" >> Dockerfile
+          echo "CMD [\"cat\", \"/report_json.json\"]" >> Dockerfile
+
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          IMAGE_TAG="ghcr.io/${REPO_OWNER}/${REPO_NAME}/dast-report:latest"
+
+          docker build -t $IMAGE_TAG .
+          docker push "$IMAGE_TAG"
+
+      - name: stop docker
+        if: always()
+        run: |
+          docker stop github-actions || true
+          docker rm github-actions || true
+          docker container prune --force || true
+          docker image prune --force || true
